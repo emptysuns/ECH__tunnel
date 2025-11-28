@@ -5,88 +5,104 @@ import (
 	"time"
 )
 
-// ======================== 暴力拥塞控制 (Violent Congestion Control) ========================
+// ======================== 拥塞控制 (Aggressive Congestion Control) ========================
 
+// ViolentCongestionController 实现了一个激进的拥塞控制算法
+// 相比传统 TCP，它采用更大的初始窗口和更激进的增长策略
 type ViolentCongestionController struct {
 	mu sync.Mutex
 
-	// 窗口控制
-	cwnd          int     // 当前拥塞窗口 (Congestion Window)
-	ssthresh      int     // 慢启动阈值
-	inFlight      int     // 已发送但未确认的数据量
-	
-	// 激进参数
-	minWindow     int     // 最小窗口 (保底速度)
-	maxWindow     int     // 最大窗口
-	growthRate    int     // 线性增长步长 (字节)
-	backoffFactor float64 // 回退因子 (0.0 - 1.0, 越大越暴力)
+	// 窗口控制参数
+	cwnd     int // 当前拥塞窗口 (Congestion Window)，单位：字节
+	ssthresh int // 慢启动阈值 (Slow Start Threshold)
+	inFlight int // 已发送但未确认的数据量
 
-	// 状态
-	lastAckTime   time.Time
-	rtt           time.Duration
-	rttVar        time.Duration
+	// 激进参数配置
+	minWindow     int     // 最小窗口，保证基础速度
+	maxWindow     int     // 最大窗口，防止过度发送
+	growthRate    int     // 线性增长步长，单位：字节/ACK
+	backoffFactor float64 // 丢包回退因子 (0.0-1.0)，越大越激进
+
+	// 网络状态
+	lastAckTime time.Time     // 最后一次收到 ACK 的时间
+	rtt         time.Duration // 平滑的往返时延
+	rttVar      time.Duration // RTT 变化量
 }
 
+// NewViolentCongestionController 创建新的拥塞控制器
 func NewViolentCongestionController() *ViolentCongestionController {
+	const (
+		initialWindow = 1 * 1024 * 1024  // 初始窗口 1MB (标准TCP约为10个MSS=14KB)
+		minWindow     = 256 * 1024       // 最小窗口 256KB
+		maxWindow     = 64 * 1024 * 1024 // 最大窗口 64MB
+		ssthresh      = 10 * 1024 * 1024 // 慢启动阈值 10MB
+		growthRate    = 64 * 1024        // 每次 ACK 增长 64KB
+		backoffFactor = 0.9              // 丢包时降至 90% (标准TCP为50%)
+	)
+
 	return &ViolentCongestionController{
-		// 暴力配置: 初始窗口直接 1MB, 极大提升启动速度
-		cwnd:          1024 * 1024, 
-		ssthresh:      1024 * 1024 * 10, // 阈值设得很高
-		
-		// 限制
-		minWindow:     256 * 1024,       // 最小不低于 256KB
-		maxWindow:     1024 * 1024 * 64, // 最大允许 64MB 窗口
-		
-		// 增长与回退
-		growthRate:    65536, // 每次ACK增加 64KB (非常激进)
-		backoffFactor: 0.9,   // 丢包时只降到 90% (标准TCP是50%)
-		
+		cwnd:          initialWindow,
+		ssthresh:      ssthresh,
+		minWindow:     minWindow,
+		maxWindow:     maxWindow,
+		growthRate:    growthRate,
+		backoffFactor: backoffFactor,
 		lastAckTime:   time.Now(),
 	}
 }
 
-// CanSend 检查是否允许发送
+// CanSend 检查是否可以发送指定大小的数据
+// 激进模式：允许超出窗口 20% 的突发流量
 func (c *ViolentCongestionController) CanSend(bytes int) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	// 暴力模式: 允许一定程度的超发 (1.2倍窗口)
+
+	// 允许 1.2 倍窗口的超发，提高突发性能
 	limit := int(float64(c.cwnd) * 1.2)
 	return c.inFlight+bytes <= limit
 }
 
-// OnDataSent 记录数据发送
+// OnDataSent 记录数据已发送，更新 inflight 计数
 func (c *ViolentCongestionController) OnDataSent(bytes int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.inFlight += bytes
 }
 
-// OnAck 处理确认 (核心逻辑)
+// OnAck 处理收到的 ACK，更新窗口和 RTT
+// 这是拥塞控制的核心逻辑
 func (c *ViolentCongestionController) OnAck(bytes int, rtt time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// 更新 inflight 计数
 	c.inFlight -= bytes
 	if c.inFlight < 0 {
 		c.inFlight = 0
 	}
 
-	// 更新 RTT (加权移动平均)
+	// 更新 RTT 估计值 (使用加权移动平均, EWMA)
 	if c.rtt == 0 {
+		// 首次测量
 		c.rtt = rtt
 		c.rttVar = rtt / 2
 	} else {
+		// RFC 6298: RTT variance 计算
 		diff := c.rtt - rtt
-		if diff < 0 { diff = -diff }
+		if diff < 0 {
+			diff = -diff
+		}
+		// rttVar = 0.75 * rttVar + 0.25 * |rtt - sample|
 		c.rttVar = time.Duration(float64(c.rttVar)*0.75 + float64(diff)*0.25)
+		// rtt = 0.875 * rtt + 0.125 * sample
 		c.rtt = time.Duration(float64(c.rtt)*0.875 + float64(rtt)*0.125)
 	}
 
-	// 暴力增长策略: 只要有ACK就增长, 不管是慢启动还是拥塞避免
-	// 线性增长 (Additive Increase), 但步长很大
+	// 激进增长策略：收到 ACK 就增长，不区分慢启动和拥塞避免
+	// 采用固定步长的加性增长 (Additive Increase)
 	c.cwnd += c.growthRate
 
-	// 限制最大窗口
+	// 限制最大窗口，防止无限增长
 	if c.cwnd > c.maxWindow {
 		c.cwnd = c.maxWindow
 	}
@@ -94,20 +110,21 @@ func (c *ViolentCongestionController) OnAck(bytes int, rtt time.Duration) {
 	c.lastAckTime = time.Now()
 }
 
-// OnLoss 处理丢包/超时
+// OnLoss 处理丢包或超时事件
+// 激进模式：仅轻微降低窗口，保持高速传输
 func (c *ViolentCongestionController) OnLoss() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// 暴力回退: 仅轻微减少窗口
+	// 激进回退：仅降至原来的 90% (标准 TCP 会降至 50%)
 	c.cwnd = int(float64(c.cwnd) * c.backoffFactor)
-	
-	// 保证底线
+
+	// 确保不低于最小窗口
 	if c.cwnd < c.minWindow {
 		c.cwnd = c.minWindow
 	}
-	
-	// 调整阈值
+
+	// 更新慢启动阈值为当前窗口大小
 	c.ssthresh = c.cwnd
 }
 
@@ -120,75 +137,68 @@ func (c *ViolentCongestionController) GetStats() (cwnd, inFlight int, rtt time.D
 
 // ======================== 网络质量监控与自适应缓冲 ========================
 
+// AdaptiveMonitor 监控网络传输速度并提供缓冲区大小建议
 type AdaptiveMonitor struct {
 	mu sync.RWMutex
-	
-	totalBytes    int64
-	startTime     time.Time
-	
-	// 动态调整的参数
-	bufferSize    int
-	
-	// 采样
-	sampleBytes   int64
-	sampleStart   time.Time
-	currentSpeed  float64 // MB/s
+
+	// 统计数据
+	totalBytes int64     // 总传输字节数
+	startTime  time.Time // 监控开始时间
+
+	// 缓冲区配置
+	bufferSize int // 当前缓冲区大小（固定 1MB）
+
+	// 速度采样
+	sampleBytes  int64     // 采样周期内的字节数
+	sampleStart  time.Time // 当前采样周期开始时间
+	currentSpeed float64   // 当前速度，单位：MB/s
 }
 
+// NewAdaptiveMonitor 创建新的自适应监控器
 func NewAdaptiveMonitor() *AdaptiveMonitor {
+	const bufferSize = 1 * 1024 * 1024 // 固定使用 1MB 缓冲区，最大化吞吐量
+
 	return &AdaptiveMonitor{
 		startTime:   time.Now(),
-		bufferSize:  256 * 1024, // 初始 256KB
+		bufferSize:  bufferSize,
 		sampleStart: time.Now(),
 	}
 }
 
+// Update 更新传输统计并计算速度
+// 每隔 1 秒重新计算一次平均速度
 func (m *AdaptiveMonitor) Update(bytes int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	
+
+	// 累加总字节数和采样周期字节数
 	m.totalBytes += int64(bytes)
 	m.sampleBytes += int64(bytes)
-	
+
 	now := time.Now()
 	duration := now.Sub(m.sampleStart)
-	
-	// 每 500ms 更新一次采样
-	if duration > 500*time.Millisecond {
-		// 计算速度 (MB/s)
+
+	// 每秒更新一次速度
+	if duration > 1*time.Second {
 		seconds := duration.Seconds()
 		if seconds > 0 {
-			m.currentSpeed = float64(m.sampleBytes) / 1024 / 1024 / seconds
+			// 计算速度：MB/s
+			m.currentSpeed = float64(m.sampleBytes) / (1024 * 1024) / seconds
 		}
-		
-		// 自适应调整缓冲区
-		// 策略: 缓冲区大小 = 当前速度 * 100ms (保持高吞吐所需的最小缓冲)
-		// 但为了暴力性能, 我们直接乘以 200ms - 500ms
-		targetBuffer := int(m.currentSpeed * 1024 * 1024 * 0.5) 
-		
-		// 限制范围
-		if targetBuffer < 64*1024 {
-			targetBuffer = 64 * 1024
-		}
-		if targetBuffer > 4*1024*1024 { // 最大 4MB
-			targetBuffer = 4 * 1024 * 1024
-		}
-		
-		// 平滑调整
-		m.bufferSize = (m.bufferSize + targetBuffer) / 2
-		
-		// 重置采样
+		// 重置采样周期
 		m.sampleStart = now
 		m.sampleBytes = 0
 	}
 }
 
+// GetBufferSize 返回推荐的缓冲区大小
+// 当前策略：固定返回 1MB，最大化吞吐量
 func (m *AdaptiveMonitor) GetBufferSize() int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.bufferSize
+	const fixedBufferSize = 1 * 1024 * 1024 // 1MB
+	return fixedBufferSize
 }
 
+// GetSpeed 返回当前传输速度 (MB/s)
 func (m *AdaptiveMonitor) GetSpeed() float64 {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
