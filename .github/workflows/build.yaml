@@ -1,4 +1,4 @@
-name: Go Build
+name: Go Cross Build
 
 on:
   push:
@@ -9,6 +9,11 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [linux, windows, darwin]
+        goarch: [amd64, arm64]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -21,5 +26,15 @@ jobs:
       - name: Download dependencies
         run: go mod download
 
-      - name: Build
-        run: go build ./...
+      - name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          mkdir -p build/bin
+          if [ "$GOOS" = "windows" ]; then
+            go build -o build/bin/ech-tunnel-${GOOS}-${GOARCH}.exe ./...
+          else
+            go build -o build/bin/ech-tunnel-${GOOS}-${GOARCH} ./...
+          fi
